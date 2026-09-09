@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "tomo-cropper"
+version = "0.2.0"
+description = "Crop the same physical region from a family of binned MRC tomograms"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { file = "LICENSE" }
+authors = [{ name = "Se Min Kim" }]
+dependencies = [
+    "matplotlib",
+    "mrcfile",
+    "numpy",
+]
+
+[project.gui-scripts]
+tomo-cropper = "tomo_cropper:main"
+
+[tool.setuptools]
+py-modules = ["tomo_cropper", "tomo_cropper_core"]
