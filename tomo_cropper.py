@@ -39,11 +39,9 @@ Requires:  pip install mrcfile numpy matplotlib
 """
 
 import os
-import re
-import csv
-import glob
 import logging
 import datetime
+import uuid
 import numpy as np
 import mrcfile
 import tkinter as tk
@@ -56,90 +54,34 @@ from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 from matplotlib.figure import Figure
 from matplotlib.widgets import RectangleSelector
 
-# Matches any family member:  <prefix>_[ODD_|EVN_]Vol[_b<N>].mrc
-# bin may be an integer or a decimal (e.g. 1.5); absence of _b means bin 1.
-MEMBER_RE = re.compile(
-    r"^(?P<prefix>.+?)_(?:(?P<kind>ODD|EVN)_)?Vol(?:_b(?P<bin>\d+(?:\.\d+)?))?\.mrc$")
-
-OUT_TAG = "_crop"
-CSV_NAME = "tomo_crop_history.csv"
-CSV_FIELDS = ["prefix", "folder", "view_file", "view_bin",
-              "cx0", "cx1", "cy0", "cy1", "cz0", "cz1", "timestamp"]
+from tomo_cropper_core import (
+    CSV_NAME,
+    OUT_TAG,
+    canonical_box as to_canonical_box,
+    family_files,
+    fmt_bin,
+    load_history,
+    normalize_box,
+    parse_member,
+    project_box,
+    upsert_history,
+)
 
 log = logging.getLogger("tomo_cropper")
-
-
-# ---------------------------------------------------------------- name helpers
-def parse_member(name):
-    """(prefix, kind, bin_float) for a family filename, or None. bin is 1.0 when
-    the name has no _b suffix. Crop outputs (*_crop.mrc) return None."""
-    if name.endswith(OUT_TAG + ".mrc"):
-        return None
-    m = MEMBER_RE.match(name)
-    if not m:
-        return None
-    b = m.group("bin")
-    return m.group("prefix"), (m.group("kind") or ""), (float(b) if b else 1.0)
-
-
-def fmt_bin(b):
-    b = float(b)
-    return str(int(b)) if b.is_integer() else ("%g" % b)
-
-
-def family_files(folder, prefix):
-    """All existing family files for a prefix, as sorted [(path, bin_float)],
-    excluding crop outputs. Discovered by glob so any binning variant counts."""
-    found = []
-    for p in glob.glob(os.path.join(folder, glob.escape(prefix) + "*.mrc")):
-        parsed = parse_member(os.path.basename(p))
-        if parsed and parsed[0] == prefix:
-            found.append((p, parsed[2]))
-    return sorted(found, key=lambda t: t[1])
-
-
-# ---------------------------------------------------------------- csv helpers
-def load_history(path):
-    """prefix -> row dict, with canonical coords as ints and view_bin as float."""
-    hist = {}
-    if not os.path.isfile(path):
-        return hist
-    try:
-        with open(path, newline="") as f:
-            for row in csv.DictReader(f):
-                try:
-                    for k in ("cx0", "cx1", "cy0", "cy1", "cz0", "cz1"):
-                        row[k] = int(round(float(row[k])))
-                    row["view_bin"] = float(row["view_bin"])
-                except (KeyError, ValueError, TypeError):
-                    continue
-                hist[row["prefix"]] = row
-    except Exception as ex:
-        log.error("could not read history %s: %s", path, ex)
-    return hist
-
-
-def upsert_history(path, row):
-    """Insert/replace one prefix row (latest wins) and rewrite the CSV."""
-    hist = load_history(path)
-    hist[row["prefix"]] = row
-    with open(path, "w", newline="") as f:
-        w = csv.DictWriter(f, fieldnames=CSV_FIELDS)
-        w.writeheader()
-        for r in hist.values():
-            w.writerow({k: r.get(k, "") for k in CSV_FIELDS})
 
 
 class Cropper:
     def __init__(self, root):
         self.root = root
         self.root.title("Tomogram cropper -- draw on a view volume, crop all binnings")
+        self._view_mrc = None    # owns the active memory map
         self.vol = None          # view volume (numpy, z,y,x)
         self.path = None         # view file path
         self.prefix = None       # <prefix>
         self.viewbin = 1.0       # bin factor of the view (float)
         self.binlabel = "b1"     # display label
         self.z = 0
+        self.root.protocol("WM_DELETE_WINDOW", self.close)
 
         # ---- top bar: open + info -------------------------------------
         bar = tk.Frame(root); bar.pack(fill="x", padx=6, pady=4)
@@ -169,8 +111,8 @@ class Cropper:
 
         # ---- options + actions ----------------------------------------
         act = tk.Frame(root); act.pack(fill="x", padx=6, pady=4)
-        self.delorig = tk.IntVar(value=1)
-        tk.Checkbutton(act, text="delete uncropped originals after crop",
+        self.delorig = tk.IntVar(value=0)
+        tk.Checkbutton(act, text="delete originals after successful crop (asks again)",
                        variable=self.delorig).pack(side="left", padx=4)
         tk.Button(act, text="Reset to full", command=self.reset_full).pack(side="left", padx=4)
         tk.Button(act, text="Apply crop", command=self.apply,
@@ -207,33 +149,57 @@ class Cropper:
             folder = os.path.dirname(self.path) if self.path else "."
         return os.path.join(folder, CSV_NAME)
 
+    def _close_view_mapping(self):
+        """Release the active view before replacing or deleting its file."""
+        handle = getattr(self, "_view_mrc", None)
+        self.vol = None
+        self._view_mrc = None
+        if handle is not None:
+            handle.close()
+
+    def _map_view(self, path):
+        """Map a 3-D view and keep its file handle alive for the GUI lifetime."""
+        candidate = None
+        try:
+            candidate = mrcfile.mmap(path, mode="r", permissive=True)
+            if candidate.data is None or candidate.data.ndim != 3:
+                raise ValueError("the selected MRC file is not a 3-D volume")
+        except Exception:
+            if candidate is not None:
+                candidate.close()
+            raise
+
+        # Only release the current view after the replacement is known-good.
+        self._close_view_mapping()
+        self._view_mrc = candidate
+        self.vol = candidate.data
+
+    def close(self):
+        """Release mapped files before closing the Tk window."""
+        self._close_view_mapping()
+        self.root.destroy()
+
     def current_box(self):
         """(x0,x1,y0,y1,z0,z1) in VIEW voxels from the entries, clamped and
         ordered low->high. None if invalid/empty."""
         if self.vol is None:
             return None
-        nz, ny, nx = self.vol.shape
         try:
-            x0, x1 = int(self.ex0.get()), int(self.ex1.get())
-            y0, y1 = int(self.ey0.get()), int(self.ey1.get())
-            z0, z1 = int(self.ez0.get()), int(self.ez1.get())
+            values = (
+                int(self.ex0.get()), int(self.ex1.get()),
+                int(self.ey0.get()), int(self.ey1.get()),
+                int(self.ez0.get()), int(self.ez1.get()),
+            )
         except ValueError:
             return None
-        x0, x1 = sorted((x0, x1)); y0, y1 = sorted((y0, y1)); z0, z1 = sorted((z0, z1))
-        x0, x1 = max(0, min(x0, nx)), max(0, min(x1, nx))
-        y0, y1 = max(0, min(y0, ny)), max(0, min(y1, ny))
-        z0, z1 = max(0, min(z0, nz)), max(0, min(z1, nz))
-        if x1 - x0 < 1 or y1 - y0 < 1 or z1 - z0 < 1:
-            return None
-        return (x0, x1, y0, y1, z0, z1)
+        return normalize_box(values, self.vol.shape)
 
     def canonical_box(self):
         """View box scaled up to bin1 (unbinned) voxels. None if no valid box."""
         box = self.current_box()
         if box is None:
             return None
-        V = self.viewbin
-        return tuple(int(round(c * V)) for c in box)
+        return to_canonical_box(box, self.viewbin)
 
     # ------------------------------------------------------------------ events
     def open_file(self):
@@ -256,8 +222,12 @@ class Cropper:
                 "Open the main _Vol file, not the _ODD_ / _EVN_ half-maps.\n"
                 "The half-maps are cropped automatically alongside it.")
             return
-        with mrcfile.mmap(p, mode="r", permissive=True) as m:
-            self.vol = np.asarray(m.data)
+        try:
+            self._map_view(p)
+        except Exception as ex:
+            log.error("could not open view %s: %s", p, ex)
+            messagebox.showerror("Could not open MRC", f"{p}\n\n{ex}")
+            return
         self.path = p
         self.prefix = prefix
         self.viewbin = binf
@@ -276,7 +246,12 @@ class Cropper:
             self.reset_full()
 
     def _propagate_from_history(self):
-        row = load_history(self._csv_path()).get(self.prefix)
+        try:
+            row = load_history(self._csv_path()).get(self.prefix)
+        except Exception as ex:
+            log.error("could not read history %s: %s", self._csv_path(), ex)
+            self.status.config(text="could not read crop history; using full volume")
+            return False
         if not row:
             return False
         V = self.viewbin
@@ -290,6 +265,9 @@ class Cropper:
         log.info("propagated previous crop for %s (canonical x[%d:%d] y[%d:%d] z[%d:%d])",
                  self.prefix, row["cx0"], row["cx1"], row["cy0"], row["cy1"],
                  row["cz0"], row["cz1"])
+        if self.current_box() is None:
+            log.warning("saved crop for %s is empty in this view", self.prefix)
+            return False
         self.status.config(text="loaded previous crop box for this prefix")
         self.draw()
         return True
@@ -339,7 +317,13 @@ class Cropper:
             return
         sl = self.vol[self.z]
         self.ax.clear()
-        vmin, vmax = np.percentile(sl, [2, 98])
+        finite = sl[np.isfinite(sl)]
+        if finite.size:
+            vmin, vmax = np.percentile(finite, [2, 98])
+            if vmax <= vmin:
+                vmax = vmin + 1
+        else:
+            vmin, vmax = 0, 1
         self.ax.imshow(sl, cmap="gray", origin="lower",
                        vmin=vmin, vmax=vmax, aspect="equal")
         box = self.current_box()
@@ -360,49 +344,60 @@ class Cropper:
         """Crop one family file using a canonical (bin1) box. The file's own bin
         is read from its name; canonical/bin gives its voxel range, clamped to
         the real header extent."""
-        cx0, cx1, cy0, cy1, cz0, cz1 = canon
         parsed = parse_member(os.path.basename(path))
-        T = parsed[2] if parsed else 1.0
+        if parsed is None:
+            raise ValueError("filename is not a recognized tomogram family member")
+        T = parsed[2]
         with mrcfile.mmap(path, mode="r", permissive=True) as m:
+            if m.data is None or m.data.ndim != 3:
+                raise ValueError("source MRC is not a 3-D volume")
             nz_t, ny_t, nx_t = m.data.shape
-            xs, xe = int(round(cx0 / T)), int(round(cx1 / T))
-            ys, ye = int(round(cy0 / T)), int(round(cy1 / T))
-            zs, ze = int(round(cz0 / T)), int(round(cz1 / T))
-            xs, xe = max(0, min(xs, nx_t)), max(0, min(xe, nx_t))
-            ys, ye = max(0, min(ys, ny_t)), max(0, min(ye, ny_t))
-            zs, ze = max(0, min(zs, nz_t)), max(0, min(ze, nz_t))
-            if xe <= xs or ye <= ys or ze <= zs:
-                raise ValueError("empty crop after clamping to this file's extent")
+            xs, xe, ys, ye, zs, ze = project_box(canon, T, m.data.shape)
             log.info("  crop %s  bin=%s  src(x,y,z)=%d,%d,%d  "
                      "-> x[%d:%d] y[%d:%d] z[%d:%d]",
                      os.path.basename(path), fmt_bin(T), nx_t, ny_t, nz_t,
                      xs, xe, ys, ye, zs, ze)
             sub = np.array(m.data[zs:ze, ys:ye, xs:xe])
-            vsize = m.voxel_size
+            vsize = m.voxel_size.copy()
         out = path[:-4] + OUT_TAG + ".mrc"
-        with mrcfile.new(out, overwrite=True) as o:
-            o.set_data(sub)
-            o.voxel_size = vsize
-            o.update_header_from_data()
+        temporary = f"{out}.tmp-{uuid.uuid4().hex}"
+        try:
+            with mrcfile.new(temporary, overwrite=False) as o:
+                o.set_data(sub)
+                o.voxel_size = vsize
+                o.update_header_from_data()
+                o.update_header_stats()
+            # Validate the completed temporary file before it can replace a
+            # previous crop. os.replace keeps replacement atomic on the same
+            # filesystem.
+            with mrcfile.mmap(temporary, mode="r", permissive=False) as check:
+                if check.data is None or check.data.shape != sub.shape:
+                    raise ValueError("written crop failed shape validation")
+            os.replace(temporary, out)
+            temporary = None
+        finally:
+            if temporary and os.path.exists(temporary):
+                os.remove(temporary)
         log.info("  wrote %s  (x,y,z = %d,%d,%d)",
                  os.path.basename(out), sub.shape[2], sub.shape[1], sub.shape[0])
         return out, sub.shape, T
 
     def _crop_files(self, items):
-        """Crop a list of (path, canon) pairs. Returns (done_lines, to_delete)."""
-        done, to_delete = [], []
+        """Crop items and return ``(written, failed, safe_to_delete)``."""
+        written, failed, to_delete = [], [], []
         for path, canon in items:
             try:
                 out, shp, T = self._crop_one(path, canon)
-                done.append(f"{os.path.basename(out)}  "
-                            f"{shp[2]}x{shp[1]}x{shp[0]}  (bin {fmt_bin(T)})")
+                written.append(f"{os.path.basename(out)}  "
+                               f"{shp[2]}x{shp[1]}x{shp[0]}  "
+                               f"(bin {fmt_bin(T)})")
                 if (os.path.isfile(out) and os.path.getsize(out) > 0
                         and os.path.abspath(out) != os.path.abspath(path)):
                     to_delete.append(path)
             except Exception as ex:
                 log.error("  FAILED %s: %s", os.path.basename(path), ex)
-                done.append(f"FAILED {os.path.basename(path)}: {ex}")
-        return done, to_delete
+                failed.append(f"{os.path.basename(path)}: {ex}")
+        return written, failed, to_delete
 
     def _delete_originals(self, to_delete):
         """Confirm once, delete verified-cropped originals, invalidate the view
@@ -421,18 +416,39 @@ class Cropper:
                 f"Cropping succeeded for {len(to_delete)} file(s).\n\n"
                 f"Delete these UNCROPPED originals now?\n"
                 f"This is permanent and cannot be undone:\n\n  {names}"):
+            view_path = self.path
+            view_key = (
+                os.path.normcase(os.path.abspath(view_path))
+                if view_path
+                else None
+            )
+            view_is_target = bool(
+                view_key
+                and any(
+                    os.path.normcase(os.path.abspath(f)) == view_key
+                    for f in to_delete
+                )
+            )
+            if view_is_target:
+                # Windows cannot remove a file while its mmap is open.
+                self._close_view_mapping()
+            deleted_paths = []
             for f in to_delete:
                 try:
                     os.remove(f)
                     log.info("  deleted %s", os.path.basename(f))
                     deleted.append(os.path.basename(f))
+                    deleted_paths.append(f)
                 except Exception as ex:
                     log.error("  DELETE FAILED %s: %s", os.path.basename(f), ex)
-            if self.path and any(os.path.abspath(f) == os.path.abspath(self.path)
-                                 for f in to_delete):
-                self.vol = None
+            if view_is_target and any(
+                    os.path.normcase(os.path.abspath(f)) == view_key
+                    for f in deleted_paths):
                 self.path = None
+                self.prefix = None
                 self.info.config(text="view file was deleted - open a new file")
+            elif view_is_target:
+                self.info.config(text="view was closed - reopen the file to continue")
         else:
             log.info("deletion cancelled by user; originals kept")
         return deleted
@@ -461,7 +477,9 @@ class Cropper:
                                    f"No _Vol files found for prefix {self.prefix}.")
             return
 
-        done, to_delete = self._crop_files([(p, canon) for p, _ in fam])
+        written, failed, to_delete = self._crop_files(
+            [(path, canon) for path, _ in fam]
+        )
 
         # record history BEFORE any deletion (so the box survives even if the
         # view file is removed)
@@ -472,22 +490,37 @@ class Cropper:
             "cy1": canon[3], "cz0": canon[4], "cz1": canon[5],
             "timestamp": datetime.datetime.now().isoformat(timespec="seconds"),
         }
-        try:
-            upsert_history(self._csv_path(folder), row)
-            log.info("history updated: %s", self._csv_path(folder))
-        except Exception as ex:
-            log.error("could not write history: %s", ex)
+        history_saved = False
+        if written:
+            try:
+                upsert_history(self._csv_path(folder), row)
+                history_saved = True
+                log.info("history updated: %s", self._csv_path(folder))
+            except Exception as ex:
+                log.error("could not write history: %s", ex)
+                failed.append(f"history was not saved: {ex}")
 
-        deleted = self._delete_originals(to_delete)
+        # Keep originals if history persistence failed.  A valid history row is
+        # part of the recovery path when source volumes are removed.
+        deleted = self._delete_originals(to_delete if history_saved else [])
 
-        log.info("done: %d written, %d deleted", len(done), len(deleted))
-        msg = ("Wrote:\n  " + "\n  ".join(done)) if done else "Wrote nothing."
+        log.info("done: %d written, %d failed, %d deleted",
+                 len(written), len(failed), len(deleted))
+        msg = ("Wrote:\n  " + "\n  ".join(written)) if written else "Wrote nothing."
+        if failed:
+            msg += "\n\nFailed / kept original:\n  " + "\n  ".join(failed)
         if deleted:
             msg += "\n\nDeleted originals:\n  " + "\n  ".join(deleted)
-        msg += f"\n\nHistory: {CSV_NAME}"
-        self.status.config(text=f"done: {len(done)} written, {len(deleted)} deleted")
-        self.clear_selection()
-        messagebox.showinfo("Crop complete", msg)
+        if history_saved:
+            msg += f"\n\nHistory: {CSV_NAME}"
+        self.status.config(
+            text=f"done: {len(written)} written, {len(failed)} failed, "
+                 f"{len(deleted)} deleted"
+        )
+        if written:
+            self.clear_selection()
+        dialog = messagebox.showwarning if failed else messagebox.showinfo
+        dialog("Crop complete", msg)
 
     def crop_from_csv(self):
         """Catch-up mode: scan a history CSV, find every binning variant of each
@@ -500,15 +533,24 @@ class Cropper:
             filetypes=[("CSV", "*.csv"), ("all", "*.*")])
         if not p:
             return
-        hist = load_history(p)
+        try:
+            hist = load_history(p)
+        except Exception as ex:
+            log.error("could not read history %s: %s", p, ex)
+            messagebox.showerror("Could not read history", f"{p}\n\n{ex}")
+            return
         if not hist:
             messagebox.showinfo("Empty", "No usable rows found in that CSV.")
             return
 
         # build the to-do list: uncropped family files per prefix
-        todo, groups = [], {}
+        todo, groups, unavailable = [], {}, []
         for prefix, row in hist.items():
-            folder = row.get("folder", "")
+            folder = str(row.get("folder", "") or "").strip()
+            if not folder or not os.path.isdir(folder):
+                log.warning("history folder missing for %s: %s", prefix, folder)
+                unavailable.append((prefix, folder or "(empty path)"))
+                continue
             canon = (row["cx0"], row["cx1"], row["cy0"],
                      row["cy1"], row["cz0"], row["cz1"])
             for fp, b in family_files(folder, prefix):
@@ -516,9 +558,25 @@ class Cropper:
                     todo.append((fp, canon))
                     groups.setdefault(prefix, []).append((os.path.basename(fp), b))
 
+        unavailable_count = len(unavailable)
+        unavailable_label = "entry" if unavailable_count == 1 else "entries"
         if not todo:
-            messagebox.showinfo("Nothing to do",
-                                "Every family file listed in the CSV already has a crop.")
+            if unavailable:
+                skipped = "\n  ".join(
+                    f"{prefix}: {folder}" for prefix, folder in unavailable
+                )
+                messagebox.showwarning(
+                    "Folders unavailable",
+                    "No uncropped files could be queued.\n\n"
+                    f"Skipped {unavailable_count} CSV {unavailable_label} because "
+                    "their "
+                    f"folders are missing or unavailable:\n\n  {skipped}",
+                )
+            else:
+                messagebox.showinfo(
+                    "Nothing to do",
+                    "Every family file listed in the CSV already has a crop.",
+                )
             log.info("crop_from_csv: nothing uncropped")
             return
 
@@ -531,24 +589,48 @@ class Cropper:
         listing = "\n".join(lines)
         log.info("crop_from_csv: %d uncropped file(s) across %d prefix(es)",
                  len(todo), len(groups))
+        unavailable_note = ""
+        if unavailable:
+            unavailable_note = (
+                f"\n\nSkipped {unavailable_count} CSV {unavailable_label} whose folders "
+                "are missing or unavailable."
+            )
         if not messagebox.askyesno(
                 "Crop uncropped files?",
                 f"Found {len(todo)} uncropped file(s) in {len(groups)} prefix(es):\n\n"
-                f"{listing}\n\nCrop all of them with their saved boxes?"):
+                f"{listing}{unavailable_note}\n\n"
+                "Crop all available files with their saved boxes?"):
             log.info("crop_from_csv: cancelled by user")
             return
 
-        done, to_delete = self._crop_files(todo)
+        written, failed, to_delete = self._crop_files(todo)
         deleted = self._delete_originals(to_delete)
-        log.info("crop_from_csv done: %d written, %d deleted", len(done), len(deleted))
-        msg = ("Wrote:\n  " + "\n  ".join(done)) if done else "Wrote nothing."
+        log.info("crop_from_csv done: %d written, %d failed, %d deleted",
+                 len(written), len(failed), len(deleted))
+        msg = ("Wrote:\n  " + "\n  ".join(written)) if written else "Wrote nothing."
+        if failed:
+            msg += "\n\nFailed / kept original:\n  " + "\n  ".join(failed)
         if deleted:
             msg += "\n\nDeleted originals:\n  " + "\n  ".join(deleted)
-        self.status.config(text=f"CSV crop: {len(done)} written, {len(deleted)} deleted")
-        messagebox.showinfo("Crop complete", msg)
+        if unavailable:
+            msg += (
+                f"\n\nSkipped {unavailable_count} CSV {unavailable_label}: "
+                "folder missing or unavailable."
+            )
+        self.status.config(
+            text=f"CSV crop: {len(written)} written, {len(failed)} failed, "
+                 f"{len(deleted)} deleted, {unavailable_count} unavailable"
+        )
+        dialog = (
+            messagebox.showwarning
+            if failed or unavailable
+            else messagebox.showinfo
+        )
+        dialog("Crop complete", msg)
 
 
-if __name__ == "__main__":
+def main():
+    """Launch the desktop application."""
     logging.basicConfig(
         level=logging.INFO,          # set to logging.DEBUG for box-drag traces
         format="%(asctime)s  %(levelname)-7s %(message)s",
@@ -558,3 +640,7 @@ if __name__ == "__main__":
     Cropper(root)
     root.mainloop()
     log.info("tomo_cropper closed")
+
+
+if __name__ == "__main__":
+    main()
