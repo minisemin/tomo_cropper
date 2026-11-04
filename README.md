@@ -12,7 +12,7 @@ Using a bin 4 (or more heavily binned) volume as the view keeps the GUI quicker
 and uses less memory while lower-bin and original tomograms are cropped with
 the corresponding coordinates.
 
-![Main crop view](https://github.com/user-attachments/assets/a5b64a80-9e66-4919-82f6-d7b8aeb008e3)
+<img width="1482" height="1087" alt="image" src="https://github.com/user-attachments/assets/4085f214-8f90-4e9e-8afc-c892ffdf37ca" />
 
 ![Crop confirmation](https://github.com/user-attachments/assets/4b058ae6-44e8-4b73-b453-a290f4671722)
 
